@@ -175,6 +175,8 @@ class AuditResult:
     patched_sha256: str = ""
     load_base: int = 0
     patched: bytes = b""
+    # 补丁前原始 .text 字节：目标映像演练校验/定位最早失配偏移时使用。
+    text_before: bytes = b""
 
     def to_public_dict(self) -> dict[str, Any]:
         """返回可序列化的审计结论（不含整个补丁后节体）。"""
@@ -680,6 +682,7 @@ def _audit(data: bytes, load_base: int, symbols: dict[str, int]) -> AuditResult:
         patched_sha256=hashlib.sha256(patched).hexdigest(),
         load_base=load_base,
         patched=bytes(patched),
+        text_before=text_bytes,
     )
 
 

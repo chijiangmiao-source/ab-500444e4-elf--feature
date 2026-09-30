@@ -57,14 +57,18 @@
             font-family: var(--mono); font-size: 11.5px; overflow:auto; max-height: 260px; white-space: pre; margin: 8px 0 0; }
   .empty { color: var(--mut); border: 1px dashed var(--line); border-radius: 8px; padding: 30px; text-align: center; }
   .toolbar { display:flex; gap:8px; align-items:center; }
+  .leftcol { display: grid; gap: 22px; align-content: start; }
+  .banner.warn { background: #2b230f; border-color: #bb8009; }
+  .banner.warn .verdict { color: #d29922; }
 </style>
 </head>
 <body>
 <header>
   <h1>ELF64 重定位载荷审计台</h1>
-  <p>仅接受 ELF64 小端 ET_REL（EM_X86_64）：唯一 <code>.text</code>、指向它的 RELA、R_X86_64_64 / R_X86_64_PC32。失败时定位首个违约项并清除旧成功结论，绝不返回部分补丁。</p>
+  <p>仅接受 ELF64 小端 ET_REL（EM_X86_64）：唯一 <code>.text</code>、指向它的 RELA、R_X86_64_64 / R_X86_64_PC32。失败时定位首个违约项并清除旧成功结论，绝不返回部分补丁。审计通过后可用目标映像演练把冻结补丁真正落到原始 .text 字节上：状态逐步持久化，中断后只会恢复为完整原像或完整补丁像。</p>
 </header>
 <main>
+  <div class="leftcol">
   <section class="card">
     <h2>提交审计</h2>
     <label for="auditId">稳定审计标识（audit_id）</label>
@@ -87,9 +91,29 @@
     </div>
   </section>
 
+  <section class="card">
+    <h2>目标映像演练</h2>
+    <p class="muted" style="font-size:12px;margin:0 0 6px">凭成功审计结论，把冻结补丁真正落到待装载的原始 .text 字节上。状态逐步持久化；中断后同标识重传只会恢复为完整原像或完整补丁像。</p>
+    <label for="drillId">稳定演练标识（drill_id）</label>
+    <input type="text" id="drillId" placeholder="如 drill-2026-09-30-001" autocomplete="off">
+
+    <label for="drillAuditId">来源审计标识（须仍为成功结论）</label>
+    <input type="text" id="drillAuditId" placeholder="与上方审计标识一致" autocomplete="off">
+
+    <label for="textInput">待装载的原始 .text 字节（二进制文件）</label>
+    <input type="file" id="textInput">
+    <div class="filemeta" id="textMeta">未选择文件</div>
+
+    <div class="row-actions">
+      <button type="button" class="primary" id="drillBtn">发起演练</button>
+      <button type="button" id="drillFetchBtn">按标识读取演练</button>
+    </div>
+  </section>
+  </div>
+
   <section class="card" id="resultPanel">
-    <h2>审计结论</h2>
-    <div id="resultBody"><div class="empty">尚未提交。审查员可在左侧提交文件，或凭稳定审计标识读取已冻结结论。</div></div>
+    <h2>审计 / 演练结论</h2>
+    <div id="resultBody"><div class="empty">尚未提交。审查员可在左侧提交审计或发起目标映像演练，并凭稳定标识读回已冻结结论。</div></div>
   </section>
 </main>
 
@@ -122,6 +146,18 @@ $("fileInput").onchange = async () => {
   for (let i = 0; i < buf.length; i += CHUNK) bin += String.fromCharCode(...buf.subarray(i, i + CHUNK));
   fileBase64 = btoa(bin);
   $("fileMeta").textContent = `${f.name} — ${buf.length} 字节 — Base64 ${fileBase64.length} 字符`;
+};
+
+let textBase64 = "";
+$("textInput").onchange = async () => {
+  const f = $("textInput").files[0];
+  if (!f) { textBase64 = ""; $("textMeta").textContent = "未选择文件"; return; }
+  const buf = new Uint8Array(await f.arrayBuffer());
+  let bin = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < buf.length; i += CHUNK) bin += String.fromCharCode(...buf.subarray(i, i + CHUNK));
+  textBase64 = btoa(bin);
+  $("textMeta").textContent = `${f.name} — ${buf.length} 字节（原始 .text 映像）`;
 };
 
 function collectSymbols() {
@@ -214,7 +250,55 @@ function renderPass(r) {
   <details><summary>重定位后 .text 十六进制转储</summary><pre class="hex">${esc(hexDump(r.patched_text_hex))}</pre></details>`;
 }
 
+function renderDrill(d) {
+  if (d.status === "completed") {
+    const items = d.items.map((it, n) => `
+      <tr>
+        <td>${n + 1}</td>
+        <td>${esc(it.offset_hex)}</td>
+        <td><span class="tag ${it.type === 1 ? "r1" : "r2"}">${esc(it.type_name)}</span></td>
+        <td><span class="sym">${esc(it.symbol)}</span></td>
+        <td class="bytes-before">${esc(it.actual_before_hex)}</td>
+        <td class="bytes-after">${esc(it.after_hex)}</td>
+      </tr>`).join("");
+    return `<div class="banner pass"><div class="verdict">✓ 演练完成（completed）— 冻结补丁已落在期望字节上</div></div>
+    <div class="kv">
+      <span class="k">演练标识</span><span>${esc(d.drill_id)}</span>
+      <span class="k">来源审计标识</span><span>${esc(d.audit_id)}</span>
+      <span class="k">来源冻结结论</span><span>${esc(d.source_conclusion)}</span>
+      <span class="k">原像 SHA-256</span><span>${esc(d.image_sha256)}</span>
+      <span class="k">最终摘要 SHA-256</span><span>${esc(d.patched_sha256)}</span>
+      <span class="k">已写补丁</span><span>${d.applied} / ${d.patch_count}</span>
+    </div>
+    <details open><summary>逐项实际写前后字节（按偏移顺序）</summary>
+      <table>
+        <thead><tr><th>#</th><th>.text 偏移</th><th>类型</th><th>符号</th><th>实际写前</th><th>写入</th></tr></thead>
+        <tbody>${items}</tbody>
+      </table>
+    </details>
+    <details><summary>完整补丁像十六进制转储</summary><pre class="hex">${esc(hexDump(d.patched_text_hex))}</pre></details>`;
+  }
+  if (d.status === "rejected") {
+    const r = d.rejection || {};
+    const rows = [];
+    const push = (k, v) => { if (v !== undefined && v !== null) rows.push(`<tr><td>${esc(k)}</td><td>${esc(v)}</td></tr>`); };
+    push("拒绝代码 code", r.code);
+    push("说明 message", r.message);
+    push("最早失配偏移", r.offset);
+    push("补丁序号 patch_index", r.patch_index);
+    push("期望字节", r.expected_hex);
+    push("实际字节", r.actual_hex);
+    return `<div class="banner fail"><div class="verdict">✕ 演练拒绝（rejected）</div>
+      <div>映像与冻结审计不符，已定位最早失配偏移；来源记录未被改动，也未留下半成品映像。</div></div>
+      <table class="viol-table">${rows.join("")}</table>`;
+  }
+  const cls = d.status === "writing" ? "warn" : "warn";
+  return `<div class="banner ${cls}"><div class="verdict">… 演练未完成（${esc(d.status)}）</div>
+    ${esc(d.message || "")}</div>`;
+}
+
 function render(r) {
+  if (r.drill_id && r.status) { $("resultBody").innerHTML = renderDrill(r); return; }
   if (r.ok) { $("resultBody").innerHTML = renderPass(r); return; }
   if (r.violation) { $("resultBody").innerHTML = renderFail(r.violation); return; }
   $("resultBody").innerHTML =
@@ -236,6 +320,7 @@ $("submitBtn").onclick = () => {
   catch (e) { $("resultBody").innerHTML = `<div class="banner fail"><div class="verdict">输入有误</div>${esc(e.message)}</div>`; return; }
   // 提交即视为新一轮审计：先清空旧成功结论的展示，最终结论完全以服务端响应为准。
   $("resultBody").innerHTML = '<div class="empty">审计中……</div>';
+  if (!$("drillAuditId").value.trim()) $("drillAuditId").value = payload.audit_id;
   handle("/api/audit", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload) });
 };
 
@@ -244,6 +329,23 @@ $("fetchBtn").onclick = () => {
   if (!id) { $("resultBody").innerHTML = `<div class="banner fail"><div class="verdict">输入有误</div>请填写稳定审计标识</div>`; return; }
   $("resultBody").innerHTML = '<div class="empty">读取中……</div>';
   handle(`/api/result/${encodeURIComponent(id)}`);
+};
+
+$("drillBtn").onclick = () => {
+  const drillId = $("drillId").value.trim();
+  const auditId = $("drillAuditId").value.trim();
+  if (!drillId || !auditId) { $("resultBody").innerHTML = `<div class="banner fail"><div class="verdict">输入有误</div>请填写演练标识与来源审计标识</div>`; return; }
+  if (!textBase64) { $("resultBody").innerHTML = `<div class="banner fail"><div class="verdict">输入有误</div>请选择待装载的原始 .text 字节文件</div>`; return; }
+  $("resultBody").innerHTML = '<div class="empty">演练执行中……</div>';
+  handle("/api/drill", { method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({ drill_id: drillId, audit_id: auditId, text_base64: textBase64 }) });
+};
+
+$("drillFetchBtn").onclick = () => {
+  const id = $("drillId").value.trim();
+  if (!id) { $("resultBody").innerHTML = `<div class="banner fail"><div class="verdict">输入有误</div>请填写稳定演练标识</div>`; return; }
+  $("resultBody").innerHTML = '<div class="empty">读取中……</div>';
+  handle(`/api/drill/${encodeURIComponent(id)}`);
 };
 </script>
 </body>

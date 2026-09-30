@@ -11,3 +11,4 @@ venv/
 *.o
 *.log
 .DS_Store
+drill_state/

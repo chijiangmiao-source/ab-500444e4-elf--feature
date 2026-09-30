@@ -5,6 +5,10 @@ services:
     environment:
       HOST: 0.0.0.0
       PORT: "8080"
+      DRILL_STATE_DIR: /app/drill_state
+    volumes:
+      # 演练状态目录持久化：进程重启后据此恢复中断演练（回滚为完整原像）
+      - drill-state:/app/drill_state
     ports:
       # 宿主端口可通过环境变量 HOST_PORT 配置，默认 8080
       - "${HOST_PORT:-8080}:8080"
@@ -15,7 +19,7 @@ services:
       retries: 10
       start_period: 3s
 
-  # 验收组件：一次运行中核对测试、构建、HTTP 冒烟，以退出码结束。
+  # 验收组件：一次运行中核对测试、构建、HTTP 冒烟与演练场景，以退出码结束。
   # 用法： docker compose --profile verify run --rm verify ; echo $?
   # 或：   HOST_PORT=9090 docker compose --profile verify up --build verify
   verify:
@@ -29,3 +33,6 @@ services:
       BASE_URL: http://web:8080
     command: ["python", "scripts/verify.py"]
     restart: "no"
+
+volumes:
+  drill-state:

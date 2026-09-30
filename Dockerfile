@@ -3,7 +3,8 @@ FROM python:3.11-slim
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     HOST=0.0.0.0 \
-    PORT=8080
+    PORT=8080 \
+    DRILL_STATE_DIR=/app/drill_state
 
 WORKDIR /app
 

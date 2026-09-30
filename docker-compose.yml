@@ -1,0 +1,31 @@
+services:
+  web:
+    build: .
+    image: elf-reloc-audit:latest
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8080"
+    ports:
+      # 宿主端口可通过环境变量 HOST_PORT 配置，默认 8080
+      - "${HOST_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request,sys; r=urllib.request.urlopen('http://127.0.0.1:8080/healthz',timeout=2); sys.exit(0 if json.load(r).get('status')=='ok' else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+
+  # 验收组件：一次运行中核对测试、构建、HTTP 冒烟，以退出码结束。
+  # 用法： docker compose --profile verify run --rm verify ; echo $?
+  # 或：   HOST_PORT=9090 docker compose --profile verify up --build verify
+  verify:
+    profiles: ["verify"]
+    build: .
+    image: elf-reloc-audit:latest
+    depends_on:
+      web:
+        condition: service_healthy
+    environment:
+      BASE_URL: http://web:8080
+    command: ["python", "scripts/verify.py"]
+    restart: "no"

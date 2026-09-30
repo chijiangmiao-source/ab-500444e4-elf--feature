@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ELF64 重定位载荷审计</title>
+<style>
+  :root {
+    --bg: #0f141b; --panel: #18202b; --panel2: #1f2937; --line: #2c3a4d;
+    --fg: #e6edf3; --mut: #93a1b3; --ok: #2ea043; --okbg: #10281a;
+    --bad: #f85149; --badbg: #2d1517; --accent: #4493f8; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.55 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+  header { padding: 20px 28px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  header h1 { margin: 0 0 4px; font-size: 19px; }
+  header p { margin: 0; color: var(--mut); font-size: 13px; }
+  main { max-width: 1180px; margin: 0 auto; padding: 22px 28px 60px; display: grid; grid-template-columns: 400px 1fr; gap: 22px; }
+  @media (max-width: 980px) { main { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 18px; }
+  .card h2 { margin: 0 0 14px; font-size: 15px; }
+  label { display: block; font-size: 12px; color: var(--mut); margin: 12px 0 4px; }
+  input[type=text], input[type=number] {
+    width: 100%; padding: 8px 10px; background: var(--panel2); border: 1px solid var(--line);
+    border-radius: 6px; color: var(--fg); font-family: var(--mono); font-size: 13px;
+  }
+  input:focus { outline: none; border-color: var(--accent); }
+  .sym-row { display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; margin-bottom: 6px; }
+  .sym-row input { margin: 0; }
+  button { cursor: pointer; border: 1px solid var(--line); border-radius: 6px; padding: 8px 14px; background: var(--panel2); color: var(--fg); font-size: 13px; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button:hover { filter: brightness(1.12); }
+  .row-actions { display: flex; gap: 8px; margin-top: 16px; }
+  .icon-btn { padding: 8px 10px; }
+  .filemeta { font-family: var(--mono); font-size: 12px; color: var(--mut); margin-top: 5px; word-break: break-all; }
+  .banner { border-radius: 8px; padding: 12px 14px; margin-bottom: 16px; border: 1px solid; font-size: 13px; }
+  .banner.pass { background: var(--okbg); border-color: var(--ok); }
+  .banner.fail { background: var(--badbg); border-color: var(--bad); }
+  .banner .verdict { font-weight: 700; font-size: 15px; margin-bottom: 4px; }
+  .banner.pass .verdict { color: #56d364; }
+  .banner.fail .verdict { color: #ff7b72; }
+  .kv { display: grid; grid-template-columns: 160px 1fr; gap: 3px 12px; font-family: var(--mono); font-size: 12.5px; margin: 6px 0; }
+  .kv .k { color: var(--mut); }
+  details { margin-top: 12px; }
+  summary { cursor: pointer; color: var(--mut); font-size: 13px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 10px; font-family: var(--mono); font-size: 12px; }
+  th, td { border: 1px solid var(--line); padding: 6px 8px; text-align: left; vertical-align: top; }
+  th { background: var(--panel2); color: var(--mut); position: sticky; top: 0; }
+  td .sym { color: #79c0ff; }
+  .bytes-before { color: #ffa198; }
+  .bytes-after { color: #56d364; }
+  .muted { color: var(--mut); }
+  .tag { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px; border: 1px solid var(--line); }
+  .tag.r1 { color: #d2a8ff; } .tag.r2 { color: #ffa657; }
+  .viol-table td:first-child { color: var(--mut); white-space: nowrap; }
+  pre.hex { background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; padding: 10px;
+            font-family: var(--mono); font-size: 11.5px; overflow:auto; max-height: 260px; white-space: pre; margin: 8px 0 0; }
+  .empty { color: var(--mut); border: 1px dashed var(--line); border-radius: 8px; padding: 30px; text-align: center; }
+  .toolbar { display:flex; gap:8px; align-items:center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>ELF64 重定位载荷审计台</h1>
+  <p>仅接受 ELF64 小端 ET_REL（EM_X86_64）：唯一 <code>.text</code>、指向它的 RELA、R_X86_64_64 / R_X86_64_PC32。失败时定位首个违约项并清除旧成功结论，绝不返回部分补丁。</p>
+</header>
+<main>
+  <section class="card">
+    <h2>提交审计</h2>
+    <label for="auditId">稳定审计标识（audit_id）</label>
+    <input type="text" id="auditId" placeholder="如 payload-2026-09-29-001" autocomplete="off">
+
+    <label for="fileInput">供应商交付的可重定位目标文件（.o）</label>
+    <input type="file" id="fileInput">
+    <div class="filemeta" id="fileMeta">未选择文件</div>
+
+    <label for="loadBase">代码装载基址（十进制或 0x 十六进制）</label>
+    <input type="text" id="loadBase" placeholder="0x400000">
+
+    <label>被引用外部符号地址</label>
+    <div id="symRows"></div>
+    <button type="button" id="addSym">+ 添加符号</button>
+
+    <div class="row-actions">
+      <button type="button" class="primary" id="submitBtn">执行审计</button>
+      <button type="button" id="fetchBtn">按标识读取冻结结论</button>
+    </div>
+  </section>
+
+  <section class="card" id="resultPanel">
+    <h2>审计结论</h2>
+    <div id="resultBody"><div class="empty">尚未提交。审查员可在左侧提交文件，或凭稳定审计标识读取已冻结结论。</div></div>
+  </section>
+</main>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+let fileBase64 = "";
+
+function addSymRow(name = "", addr = "") {
+  const row = document.createElement("div");
+  row.className = "sym-row";
+  row.innerHTML =
+    `<input type="text" class="sym-name" placeholder="符号名（如 memcpy）" autocomplete="off">` +
+    `<input type="text" class="sym-addr" placeholder="地址（如 0x7f1234）" autocomplete="off">` +
+    `<button type="button" class="icon-btn" title="删除">✕</button>`;
+  row.querySelector("button").onclick = () => row.remove();
+  row.querySelector(".sym-name").value = name;
+  row.querySelector(".sym-addr").value = addr;
+  $("symRows").appendChild(row);
+}
+$("addSym").onclick = () => addSymRow();
+addSymRow();
+
+$("fileInput").onchange = async () => {
+  const f = $("fileInput").files[0];
+  if (!f) { fileBase64 = ""; $("fileMeta").textContent = "未选择文件"; return; }
+  const buf = new Uint8Array(await f.arrayBuffer());
+  let bin = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < buf.length; i += CHUNK) bin += String.fromCharCode(...buf.subarray(i, i + CHUNK));
+  fileBase64 = btoa(bin);
+  $("fileMeta").textContent = `${f.name} — ${buf.length} 字节 — Base64 ${fileBase64.length} 字符`;
+};
+
+function collectSymbols() {
+  const out = {};
+  for (const row of $("symRows").children) {
+    const name = row.querySelector(".sym-name").value.trim();
+    const addr = row.querySelector(".sym-addr").value.trim();
+    if (!name && !addr) continue;
+    if (!name || !addr) throw new Error("存在未填完整的符号行（名称与地址均必填）");
+    out[name] = addr;
+  }
+  return out;
+}
+
+function buildPayload() {
+  const auditId = $("auditId").value.trim();
+  if (!auditId) throw new Error("请填写稳定审计标识");
+  if (!fileBase64) throw new Error("请选择 .o 文件");
+  const base = $("loadBase").value.trim();
+  if (!base) throw new Error("请填写代码装载基址");
+  return { audit_id: auditId, file_base64: fileBase64, load_base: base, symbols: collectSymbols() };
+}
+
+function esc(s) { return String(s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+
+function hexDump(hex) {
+  const bytes = [];
+  for (let i = 0; i < hex.length; i += 2) bytes.push(hex.substr(i, 2));
+  let out = "偏移      00 01 02 03 04 05 06 07  08 09 0a 0b 0c 0d 0e 0f\n";
+  for (let i = 0; i < bytes.length; i += 16) {
+    const part = bytes.slice(i, i + 16);
+    const left = part.slice(0, 8).join(" "), right = part.slice(8).join(" ");
+    out += `0x${i.toString(16).padStart(6, "0")}  ${(left + "  " + right).padEnd(49)}\n`;
+  }
+  return out;
+}
+
+function renderFail(v) {
+  const rows = [];
+  const push = (k, val) => { if (val !== undefined && val !== null) rows.push(`<tr><td>${esc(k)}</td><td>${esc(val)}</td></tr>`); };
+  push("违约阶段 stage", v.stage);
+  push("违约代码 code", v.code);
+  push("说明 message", v.message);
+  push("首个违约项序号 entry_index", v.entry_index);
+  push("所在 RELA 节", v.rela_section);
+  push("节内 RELA 下标 rela_index", v.rela_index);
+  push(".text 写入偏移", v.offset);
+  push("重定位类型", v.type_name);
+  push("符号", v.symbol);
+  if (v.detail) push("明细 detail", JSON.stringify(v.detail));
+  return `<div class="banner fail"><div class="verdict">✕ 审计拒绝（FAIL）</div>
+    <div>首个违约位置已定位如下；该标识下任何旧的成功结论均已被服务端清除，不会生成部分补丁。</div></div>
+    <table class="viol-table">${rows.join("")}</table>`;
+}
+
+function renderPass(r) {
+  const items = r.items.map((it, n) => `
+    <tr>
+      <td>${n + 1}</td>
+      <td>${esc(it.offset_hex)}</td>
+      <td><span class="tag ${it.type === 1 ? "r1" : "r2"}">${esc(it.type_name)}</span></td>
+      <td><span class="sym">${esc(it.symbol)}</span><div class="muted">sym#${it.symbol_index} @ ${esc(it.rela_section)}[${it.rela_index}]</div></td>
+      <td>${esc(it.S)}</td>
+      <td>${esc(it.A)}<div class="muted">${esc(it.A_hex)}</div></td>
+      <td>${esc(it.P)}</td>
+      <td>${esc(it.value)}</td>
+      <td class="bytes-before">${esc(it.before_hex)}</td>
+      <td class="bytes-after">${esc(it.after_hex)}</td>
+    </tr>`).join("");
+  const patches = r.patches.map((p) =>
+    `${p.offset_hex}  +${p.width}  ${p.type_name}  ${p.symbol}  ${p.before_hex} -> ${p.after_hex}`).join("\n");
+  return `<div class="banner pass"><div class="verdict">✓ 审计通过（PASS）— 结论已冻结</div></div>
+  <div class="kv">
+    <span class="k">审计标识</span><span>${esc(r.audit_id)}</span>
+    <span class="k">冻结结论 SHA-256</span><span>${esc(r.conclusion)}</span>
+    <span class="k">原始文件 SHA-256</span><span>${esc(r.file_sha256)}</span>
+    <span class="k">装载基址</span><span>${esc(r.load_base)}</span>
+    <span class="k">.text 大小</span><span>${r.text_size} 字节</span>
+    <span class="k">补丁前 .text SHA-256</span><span>${esc(r.text_sha256_before)}</span>
+    <span class="k">重定位后代码摘要 SHA-256</span><span>${esc(r.patched_sha256)}</span>
+    <span class="k">重定位项数</span><span>${r.item_count}</span>
+  </div>
+  <details open><summary>逐项复算（S 符号地址 / A 加数 / P 写入位置 / 计算值 / 写入前后字节），按偏移排序</summary>
+    <table>
+      <thead><tr><th>#</th><th>.text 偏移</th><th>类型</th><th>符号</th><th>S</th><th>A</th><th>P</th><th>计算值</th><th>写入前</th><th>写入后</th></tr></thead>
+      <tbody>${items || '<tr><td colspan="10" class="muted">无重定位项</td></tr>'}</tbody>
+    </table>
+  </details>
+  <details><summary>按偏移排序的字节补丁清单</summary><pre class="hex">${esc(patches) || "（无）"}</pre></details>
+  <details><summary>重定位后 .text 十六进制转储</summary><pre class="hex">${esc(hexDump(r.patched_text_hex))}</pre></details>`;
+}
+
+function render(r) {
+  if (r.ok) { $("resultBody").innerHTML = renderPass(r); return; }
+  if (r.violation) { $("resultBody").innerHTML = renderFail(r.violation); return; }
+  $("resultBody").innerHTML =
+    `<div class="banner fail"><div class="verdict">请求失败（${esc(r.error || "error")}）</div>${esc(r.message || JSON.stringify(r))}</div>`;
+}
+
+async function handle(req, opts) {
+  let resp, body;
+  try { resp = await fetch(req, opts); }
+  catch (e) { $("resultBody").innerHTML = `<div class="banner fail"><div class="verdict">网络错误</div>${esc(e.message)}</div>`; return; }
+  try { body = await resp.json(); }
+  catch { body = { ok: false, violation: { stage: "http", code: "bad_response", message: `HTTP ${resp.status}：响应不是 JSON` } }; }
+  render(body);
+}
+
+$("submitBtn").onclick = () => {
+  let payload;
+  try { payload = buildPayload(); }
+  catch (e) { $("resultBody").innerHTML = `<div class="banner fail"><div class="verdict">输入有误</div>${esc(e.message)}</div>`; return; }
+  // 提交即视为新一轮审计：先清空旧成功结论的展示，最终结论完全以服务端响应为准。
+  $("resultBody").innerHTML = '<div class="empty">审计中……</div>';
+  handle("/api/audit", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload) });
+};
+
+$("fetchBtn").onclick = () => {
+  const id = $("auditId").value.trim();
+  if (!id) { $("resultBody").innerHTML = `<div class="banner fail"><div class="verdict">输入有误</div>请填写稳定审计标识</div>`; return; }
+  $("resultBody").innerHTML = '<div class="empty">读取中……</div>';
+  handle(`/api/result/${encodeURIComponent(id)}`);
+};
+</script>
+</body>
+</html>

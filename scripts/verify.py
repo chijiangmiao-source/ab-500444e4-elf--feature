@@ -4,10 +4,16 @@
 
 1. 单元测试（``python -m unittest`` 全量）；
 2. 构建检查（全部源码字节编译 + 关键模块导入）；
-3. HTTP 冒烟（健康检查 + 三个必测场景）：
+3. HTTP 冒烟（健康检查 + 原审计三个必测场景）：
    a. 双类型重定位（R_X86_64_64 + R_X86_64_PC32）成功并逐项返回 S/A/P；
    b. 重叠写入被拒绝（patch_overlap）；
    c. PC32 有符号 32 位溢出被拒绝（pc32_overflow），且无部分结果。
+4. 目标映像演练（在成功结论上）：
+   a. 双类型成功演练：最终摘要与冻结补丁像一致，逐项实际写前/写后字节正确；
+   b. 首字节失配：定位最早偏移 0x0 并拒绝，不留下半成品映像；
+   c. 中途故障后恢复：第 1 个补丁后进程中断（真实子进程重启），重启只
+      恢复为完整原像（INTERRUPTED，绝不报告成功/暴露混合字节），同标识
+      合法重传后成为完整补丁像；同标识改换目标字节返回 409 冲突。
 
 任何一步失败立即以非零退出码结束；全部成功退出码为 0。
 """
@@ -15,12 +21,14 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import py_compile
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -44,9 +52,8 @@ def fail(msg: str) -> None:
     print(f"verify: FAIL — {msg}", flush=True)
     sys.exit(1)
 
-
 def check_unit_tests() -> None:
-    step("1/3 单元测试")
+    step("1/4 单元测试")
     proc = subprocess.run(
         [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"],
         cwd=ROOT,
@@ -57,7 +64,7 @@ def check_unit_tests() -> None:
 
 
 def check_build() -> None:
-    step("2/3 构建检查（字节编译 + 模块导入）")
+    step("2/4 构建检查（字节编译 + 模块导入）")
     for py in list((ROOT / "app").rglob("*.py")) + [Path(__file__)]:
         try:
             py_compile.compile(str(py), doraise=True)
@@ -76,8 +83,8 @@ def check_build() -> None:
     print("verify: 构建检查通过")
 
 
-def http_get(path: str) -> tuple[int, dict | None]:
-    req = urllib.request.Request(BASE_URL + path, method="GET")
+def http_get(path: str, *, base: str = BASE_URL) -> tuple[int, dict | None]:
+    req = urllib.request.Request(base + path, method="GET")
     try:
         with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
             raw = resp.read()
@@ -91,9 +98,9 @@ def http_get(path: str) -> tuple[int, dict | None]:
         return exc.code, body
 
 
-def http_post(path: str, payload: dict) -> tuple[int, dict]:
+def http_post(path: str, payload: dict, *, base: str = BASE_URL) -> tuple[int, dict]:
     req = urllib.request.Request(
-        BASE_URL + path,
+        base + path,
         data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -103,6 +110,18 @@ def http_post(path: str, payload: dict) -> tuple[int, dict]:
             return resp.status, json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         return exc.code, json.loads(exc.read())
+
+
+def wait_for_health_base(base: str, attempts: int = 30) -> None:
+    for i in range(attempts):
+        try:
+            status, body = http_get("/healthz", base=base)
+            if status == 200 and body and body.get("status") == "ok":
+                return
+        except (urllib.error.URLError, ConnectionError, OSError):
+            pass
+        time.sleep(1)
+    fail(f"本地演练服务在 {attempts}s 内未通过健康检查：{base}/healthz")
 
 
 def wait_for_health(attempts: int = 30) -> None:
@@ -161,7 +180,7 @@ def pc32_overflow_elf() -> bytes:
 
 
 def check_http_smoke() -> None:
-    step("3/3 HTTP 冒烟")
+    step("3/4 HTTP 冒烟")
     wait_for_health()
 
     # 页面可访问且包含审计台标记
@@ -251,11 +270,211 @@ def check_http_smoke() -> None:
     print("verify: PC32 有符号 32 位溢出已拒绝，未生成部分结果")
 
 
+def _start_drill_server(data_dir: Path, port: int, crash_after: str | None = None) -> subprocess.Popen:
+    env = dict(os.environ)
+    env.update(
+        {
+            "HOST": "127.0.0.1",
+            "PORT": str(port),
+            "REHEARSAL_DATA_DIR": str(data_dir),
+            "QUIET_LOGS": "1",
+            "PYTHONUNBUFFERED": "1",
+        }
+    )
+    env.pop("REHEARSAL_CRASH_AFTER", None)
+    if crash_after:
+        env["REHEARSAL_CRASH_AFTER"] = crash_after
+    return subprocess.Popen(
+        [sys.executable, "-m", "app.server"],
+        cwd=ROOT,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _free_port() -> int:
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+class _LocalServer:
+    """在临时目录上启动/停止一个真实服务子进程（用于演练重启验证）。"""
+
+    def __init__(self, data_dir: Path, port: int, crash_after: str | None = None):
+        self.proc = _start_drill_server(data_dir, port, crash_after)
+
+    def close(self) -> None:
+        proc, self.proc = self.proc, None
+        if proc is None:
+            return
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=10)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+def check_rehearsal() -> None:
+    step("4/4 目标映像演练（双类型成功 / 首字节失配 / 中途故障恢复）")
+
+    data_dir = Path(tempfile.mkdtemp(prefix="verify-drills-"))
+    port = _free_port()
+    base = f"http://127.0.0.1:{port}"
+
+    with _LocalServer(data_dir, port) as _:
+        wait_for_health_base(base)
+
+        # 先在本地服务冻结双类型成功审计（作为演练来源）
+        audit_payload = {
+            "audit_id": "verify-drill-src",
+            "file_base64": b64(double_type_elf()),
+            "load_base": 0x400000,
+            "symbols": {"ext_foo": 0x500000, "memcpy": 0x400200},
+        }
+        status, src = http_post("/api/audit", audit_payload, base=base)
+        if status != 200 or not src.get("ok"):
+            fail(f"演练来源审计应成功：HTTP {status} {src}")
+
+        original_text = bytes(range(src["text_size"]))
+        patched_text = bytes.fromhex(src["patched_text_hex"])
+        if hashlib.sha256(original_text).hexdigest() != src["text_sha256_before"]:
+            fail("测试夹具异常：构造映像与来源代码摘要不一致")
+
+        def drill_payload(rid, image=original_text):
+            return {
+                "rehearsal_id": rid,
+                "audit_id": "verify-drill-src",
+                "conclusion": src["conclusion"],
+                "image_base64": b64(image),
+                "text_size": src["text_size"],
+                "text_sha256_before": src["text_sha256_before"],
+                "patches": [
+                    {"offset": p["offset"], "before_hex": p["before_hex"]}
+                    for p in src["patches"]
+                ],
+            }
+
+        # --- 场景 a：双类型成功演练 -----------------------------------
+        status, body = http_post("/api/rehearse", drill_payload("drill-ok"), base=base)
+        if status != 200 or body.get("status") != "COMPLETED" or not body.get("ok"):
+            fail(f"双类型演练应完成：HTTP {status} {json.dumps(body, ensure_ascii=False)[:600]}")
+        if body["final_sha256"] != src["patched_sha256"] or not body["final_matches"]:
+            fail("演练最终摘要与冻结补丁像不一致")
+        if [it["offset"] for it in body["items"]] != sorted(it["offset"] for it in body["items"]):
+            fail("演练未按既有偏移顺序写入")
+        for it in body["items"]:
+            if not it["byte_match"] or it["actual_before_hex"] != it["expected_before_hex"] \
+                    or it["actual_after_hex"] != it["expected_after_hex"]:
+                fail(f"逐项实际写前后字节与冻结补丁不符：{it}")
+        if (data_dir / "drill-ok" / "image.bin").read_bytes() != patched_text:
+            fail("落盘映像不是完整补丁像")
+        if (data_dir / "drill-ok" / "original.bin").read_bytes() != original_text:
+            fail("持久化原像不是完整原始 .text")
+
+        # 合法重传：读取同一冻结演练
+        status, again = http_post("/api/rehearse", drill_payload("drill-ok"), base=base)
+        if status != 200 or again["final_sha256"] != body["final_sha256"] \
+                or again["items"] != body["items"]:
+            fail("同标识合法重传未返回同一冻结演练")
+        print(f"verify: 双类型演练完成，最终摘要 {body['final_sha256']}，逐项字节一致")
+
+        # --- 场景 b：首字节失配，定位最早偏移 0x0 ----------------------
+        tampered = b"\x5a" + original_text[1:]
+        status, bad = http_post("/api/rehearse", drill_payload("drill-bad", tampered), base=base)
+        if status != 200 or bad.get("status") != "REJECTED" or bad.get("ok"):
+            fail(f"首字节失配应拒绝演练：HTTP {status} {bad}")
+        rj = bad["rejection"]
+        if rj["code"] != "before_byte_mismatch" or rj["detail"]["earliest_offset"] != "0x0":
+            fail(f"未定位到最早偏移 0x0：{rj}")
+        bad_dir = data_dir / "drill-bad"
+        if (bad_dir / "image.bin").exists() or (bad_dir / "original.bin").exists():
+            fail("拒绝演练后不得留下半成品映像")
+        status, fetched = http_get("/api/rehearsal/drill-bad", base=base)
+        if status != 200 or fetched.get("status") != "REJECTED":
+            fail("拒绝状态未持久化")
+        print("verify: 首字节失配已拒绝（最早偏移 0x0），无半成品映像，拒绝状态已持久化")
+
+        # --- 同标识改换目标字节 -> 409 冲突，既有演练不变 --------------
+        tampered2 = bytearray(original_text)
+        tampered2[30] ^= 1
+        status, conflict = http_post(
+            "/api/rehearse", drill_payload("drill-ok", bytes(tampered2)), base=base
+        )
+        if status != 409 or conflict.get("error") != "rehearsal_conflict":
+            fail(f"改换目标字节应返回 409 冲突：HTTP {status} {conflict}")
+        status, untouched = http_get("/api/rehearsal/drill-ok", base=base)
+        if untouched.get("status") != "COMPLETED" or untouched["final_sha256"] != body["final_sha256"]:
+            fail("冲突请求改动了既有冻结演练")
+        print("verify: 同标识改换目标字节返回 409，既有冻结演练未改动")
+
+    # --- 场景 c：第 1 个补丁后进程中断（真实重启） ----------------------
+    # 以故障注入启动同一持久化目录：第 1 个补丁写完即中断。
+    # 审计来源记录保存在服务进程内存中，重启后以相同输入重新冻结一次
+    # （相同输入 => 相同冻结结论，幂等）；演练记录本身则全部来自磁盘。
+    with _LocalServer(data_dir, port, crash_after="drill-crash:1") as _:
+        wait_for_health_base(base)
+        status, src2 = http_post("/api/audit", audit_payload, base=base)
+        if status != 200 or not src2.get("ok") or src2["conclusion"] != src["conclusion"]:
+            fail(f"重启后重放冻结审计失败或结论漂移：{status} {src2}")
+        status, crashed = http_post("/api/rehearse", drill_payload("drill-crash"), base=base)
+        if status != 500 or crashed.get("error") != "crash_injected":
+            fail(f"故障注入应在第 1 个补丁后中断：HTTP {status} {crashed}")
+        time.sleep(0.2)
+        # 此刻磁盘上确曾是混合字节（首补丁已落盘，其余仍为原像）
+        mixed = (data_dir / "drill-crash" / "image.bin").read_bytes()
+        if mixed != patched_text[:8] + original_text[8:]:
+            fail("故障注入点磁盘上应为已写 1 项的混合字节")
+
+    # 真实重启（无注入）：打开记录只恢复完整原像，绝不报告成功。
+    with _LocalServer(data_dir, port) as _:
+        wait_for_health_base(base)
+        # 重新冻结相同来源审计（结论必须一致），让“来源仍为成功结论”成立
+        status, src3 = http_post("/api/audit", audit_payload, base=base)
+        if status != 200 or not src3.get("ok") or src3["conclusion"] != src["conclusion"]:
+            fail(f"重启后重放冻结审计失败或结论漂移：{status} {src3}")
+        status, view = http_get("/api/rehearsal/drill-crash", base=base)
+        if status != 200 or view.get("status") != "INTERRUPTED" or view.get("ok"):
+            fail(f"重启后必须是 INTERRUPTED 且不成功：HTTP {status} {view}")
+        if view.get("recovered_to") != "ORIGINAL" or "final_sha256" in view or "items" in view:
+            fail("中断状态不得报告成功或暴露混合字节明细")
+        if (data_dir / "drill-crash" / "image.bin").read_bytes() != original_text:
+            fail("重启后映像必须整体恢复为完整原像")
+        # 再读一次仍不得自动变成成功
+        status, view2 = http_get("/api/rehearsal/drill-crash", base=base)
+        if view2.get("status") != "INTERRUPTED":
+            fail("中断状态在重传前不得自行变为成功")
+
+        # 同标识合法重传：从完整原像重放为完整补丁像
+        status, done = http_post("/api/rehearse", drill_payload("drill-crash"), base=base)
+        if status != 200 or done.get("status") != "COMPLETED" or not done.get("ok"):
+            fail(f"合法重传应完成演练：HTTP {status} {done}")
+        if done["final_sha256"] != src["patched_sha256"]:
+            fail("恢复重放后的最终摘要与冻结补丁像不一致")
+        if not all(it["byte_match"] for it in done["items"]):
+            fail("恢复重放后逐项实际字节不符")
+        if (data_dir / "drill-crash" / "image.bin").read_bytes() != patched_text:
+            fail("恢复重放后落盘映像不是完整补丁像")
+        print("verify: 第 1 个补丁后中断 -> 重启仅恢复完整原像（INTERRUPTED），"
+              "同标识合法重传后成为完整补丁像")
+
+
 def main() -> None:
     print(f"verify: 目标服务 {BASE_URL}")
     check_unit_tests()
     check_build()
     check_http_smoke()
+    check_rehearsal()
     print("\n=== verify: ALL CHECKS PASSED ===", flush=True)
     sys.exit(0)
 

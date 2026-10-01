@@ -11,3 +11,6 @@ venv/
 *.o
 *.log
 .DS_Store
+
+# 演练持久化数据（容器内使用挂载卷 /data/rehearsals）
+data/

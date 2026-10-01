@@ -11,5 +11,7 @@ __pycache__/
 .npm-cache/
 .pnpm-store/
 .yarn-cache/
+# 演练持久化数据（默认 data/rehearsals）
+data/
 *.pyc
 *.pyo
